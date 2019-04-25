@@ -1,0 +1,44 @@
+[String]$monitorProcesses = 'notePad' #name of the process you want to monitor
+[PSObject]$oldProcess = New-Object -TypeName System.Collections.Generic.List[PSObject] #is this the correct way to declare a list of objects? I dunno
+[PSObject]$startedProcess = New-Object -TypeName System.Collections.Generic.List[PSObject]
+
+#This we want to run as a Job
+[ScriptBlock]$scriptBlock = {
+    Param ([PSObject]$process)
+    #Record the running process in CSV file
+    $process | Export-Csv -Append -LiteralPath "U:\csvLog.csv" -Force
+
+    #waiting until the process closes
+    Wait-Process -Id $process.ID 
+
+    #update the object holding the process data to reflect it ended
+    $process.Time = Get-Date -Format G #get the time the process ended
+    $process.IsOpen = 0 #1 is running, 0 is not
+    $process | Export-CSV -Append -LiteralPath "U:\csvLog.csv" -Force #record the closed process in csv file
+}
+
+While ($True) { #endless loop
+    #Store the process object with some custom attributes
+    #StartTime is a hidden attribute that shows what time the process started
+    #IsOpen indicates if process is running or not
+    $startedProcess = Get-Process -name $monitorProcesses -ErrorAction SilentlyContinue | 
+        Select-Object `
+            ProcessName, `
+            ID, `
+            @{N='Time';E={$_.StartTime}}, `
+            @{N='IsOpen';E={1}}
+
+    #Compare running processes against an older list of processes to see if there are any new ones.
+    #For each new process start a job with the scriptblock and pass it the process object
+    $startedProcess | 
+        Where-Object {$oldProcess.ID -notcontains $_.ID} | 
+        ForEach-Object {Start-Job -Scriptblock $scriptBlock -ArgumentList $_ | Out-Null}
+
+    $oldProcess = $startedProcess #update the 'older' list of processes
+    Start-Sleep -s 10 #pause for 10 seconds, this means it will only log new processes every 10 seconds
+    #Clean up jobs after they are done!
+    #Note, this won't clean up jobs if you stop the script before every process has been closed
+    Get-Job | 
+        Where-Object {$_.State -eq 'Completed'} | 
+        Remove-Job
+} #end of the while loop
