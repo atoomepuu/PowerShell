@@ -1,0 +1,138 @@
+$inputXML =@"
+<Window x:Class="UserProfileGUI.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:local="clr-namespace:UserProfileGUI"
+        mc:Ignorable="d"
+        Title="User Profiles" Height="350" Width="580" ResizeMode="CanMinimize" ForceCursor="True">
+    <Grid>
+        <TextBox x:Name="tbComputerName" HorizontalAlignment="Left" Height="23" Margin="10,10,0,0" TextWrapping="Wrap" Text="Computer Name" VerticalAlignment="Top" Width="549"/>
+        <ListView x:Name="lvProfileList" HorizontalAlignment="Left" Height="233" Margin="10,38,0,0" VerticalAlignment="Top" Width="549">
+            <ListView.View>
+                <GridView>
+                    <GridViewColumn Header="UserName" DisplayMemberBinding="{Binding 'UserName'}" Width="110"/>
+                    <GridViewColumn Header="Loaded" DisplayMemberBinding="{Binding 'Loaded'}" Width="50" />
+                    <GridViewColumn Header="Last Use Time" DisplayMemberBinding="{Binding 'LastUseTime'}" Width="140"/>
+                    <GridViewColumn Header="Roaming Path" DisplayMemberBinding="{Binding 'RoamingPath'}" Width="219"/>
+                </GridView>
+            </ListView.View>
+        </ListView>
+        <Button x:Name="bDeleteProfile" Content="Get Profiles" HorizontalAlignment="Left" Margin="10,276,0,0" VerticalAlignment="Top" Width="549" Height="23">
+            <Button.Effect>
+                <DropShadowEffect/>
+            </Button.Effect>
+        </Button>
+    </Grid>
+</Window>
+"@
+
+$inputXML = $inputXML -replace 'mc:Ignorable="d"','' -replace "x:N",'N' -replace '^<Win.*', '<Window'
+[void][System.Reflection.Assembly]::LoadWithPartialName('presentationframework')
+[xml]$XAML = $inputXML
+
+#Read XAML
+$reader=(New-Object System.Xml.XmlNodeReader $xaml)
+try{
+    $Form=[Windows.Markup.XamlReader]::Load( $reader )
+}
+catch{
+    Write-Warning "Unable to parse XML, with error: $($Error[0])`n Ensure that there are NO SelectionChanged or TextChanged properties in your textboxes (PowerShell cannot process them)"
+    throw
+}
+
+#Load XAML
+$xaml.SelectNodes("//*[@Name]") | %{
+try {
+Set-Variable -Name "$($_.Name)" -Value $Form.FindName($_.Name) -ErrorAction Stop}
+Catch {}
+}
+
+######
+#End of XAML stuff
+######
+
+#function to get the list of profiles from the computer
+Function Get-ProfileList {
+    [System.Windows.Forms.Cursor]::Current = 'WaitCursor' #show the script is working
+    $lvProfileList.Items.Clear() #Clear the profile list box to make room for new list
+    Try{
+        #get list of profiles from computer
+        $Profiles = Get-CIMInstance -Class Win32_UserProfile -ComputerName $tbComputerName.Text -Property * -ErrorAction Stop | Where-Object {$_.Special -eq $false}| Sort-Object -property Loaded, LastUseTime -Descending | Select @{Name="UserName";Expression={$_.LocalPath.Replace('C:\Users\','')}}, Loaded, LastUseTime, RoamingPath
+    }
+    Catch [System.Management.Automation.ActionPreferenceStopException]{ #Error if cannot connect to the computer
+        [System.Windows.MessageBox]::Show('Error: Could not find PC!','Error: Computer Not Found','Ok','Error')
+    }
+    Catch {#other errors
+            [System.Windows.MessageBox]::Show('Error: Could not load profiles!','Error: Profiles Not Loaded','Ok','Error')
+        }
+    $profiles | % {$lvProfileList.AddChild($_)} #put the list of profiles in the profile box
+
+    [System.Windows.Forms.Cursor]::Current = 'Default'
+}
+
+#load the profiles if I typed in a computer name press enter
+$tbComputerName.Add_KeyDown({
+    $bDeleteProfile.Content = "Get Profiles" #change the button text
+    if($_.Key -eq 'Enter' -and $tbComputerName -ne "Computer Name"){
+        Get-ProfileList
+    }
+})
+
+#highlight the text in the computername box
+$tbComputerName.Add_GotKeyboardFocus({
+    $tbComputerName.SelectAll()
+})
+
+#highlight the text in the computername box
+$tbComputerName.Add_PreviewMouseLeftButtonUp({
+    $tbComputerName.SelectAll()
+})
+
+#change the content of the button when profile(s) selected
+$lvProfileList.Add_SelectionChanged({
+    $bDeleteProfile.Content = "Delete Selected Profile(s)"
+})    
+
+#What happens when you click the button
+#Delete the profile(s)
+$bDeleteProfile.Add_Click({
+    #it won't delete anything unless the button text says 'Delete'
+    #this prevents it from spinning its wheels if no profiles are selected
+    if ($bDeleteProfile.Content -eq "Delete Selected Profile(s)"){
+        Try{
+            #get the list of profiles
+            $profiles = $lvProfileList.SelectedItems | Select-Object @{N="UserName";E={"*"+$_.UserName+"*"}}, Loaded, LastUseTime, RoamingPath
+            $profilelist = $lvProfileList.SelectedItems | Select-Object -ExpandProperty Username | Out-String
+            #warning before deleting
+            $approve = [System.Windows.MessageBox]::Show("Warning: Deleting the following profiles:`n`n$profilelist",'Warning: Confirm Deleting Profiles','OkCancel','Warning')
+            if ($approve -like "ok"){ #if delete is confirmed
+                [System.Windows.Forms.Cursor]::Current = 'WaitCursor' #show it is working
+                Foreach ($profile in $profiles){ #go through the list of selected profiles
+                    #building the list of profiles that matches the ones selected
+                    #I match the local profile path and roaming profile path
+                    $deleteProfile = Get-CIMInstance -classname Win32_UserProfile -ComputerName $tbComputerName.Text -ErrorAction STOP | Where {$_.LocalPath -like $profile.UserName -and $_.RoamingPath -eq $profile.RoamingPath} 
+                    foreach ($profile in $deleteProfile) { #Go through each profile in the list
+                        #<#Line is for testing#>$pathName = $profile.LocalPath
+                        #<#Line is for testing#>[System.Windows.MessageBox]::Show("Warning: Deleting profile:`n`n$pathName",'Warning: Confirm Deleting Profile','OkCancel','Warning')
+                        $profile | Remove-CimInstance -ErrorAction SilentlyContinue #Remove the profile!
+
+                        #sometimes Remove-CimInstances doesn't always delete the entire local folder
+                        #I check to see if the folder is still there and if it is, delete it
+                        $localProfilePath = "\\"+$tbComputerName.text+"\"+$profile.Localpath
+                        if (test-path $localProfilePath) {Remove-Item -Path $localProfilePath -Recurse -Force -ErrorAction SilentlyContinue}
+                    }
+                }
+            }
+        }
+    
+        Catch{#if anything failed
+            [System.Windows.MessageBox]::Show('Error: Could not delete profile!','Error: Profile Delete Failure','Ok','Error')
+        }
+        [System.Windows.Forms.Cursor]::Current = 'Default'
+    }
+    Get-ProfileList #the default action when you press the button
+})
+
+$Form.ShowDialog() | Out-Null
