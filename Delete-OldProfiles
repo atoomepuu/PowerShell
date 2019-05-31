@@ -1,0 +1,99 @@
+#Script to go through a list of PCs on a file and delete any User profiles older than 30 days
+#It uses multithreading to delete profiles from multiple computers at the same time.
+#I use Task Scheduler to run this script monthly
+
+$computerList = Import-CSV "C:\ScriptData\ComputerList.csv" | Select-Object -ExpandProperty Name
+#Stopwatch object--I like keeping track of how long my script runs
+#It helps me determine how large to make my runspace pool
+#keep increasing the pool until 
+$stopwatch = New-Object System.Diagnostics.Stopwatch
+$stopwatch.Start()
+
+#This is the code that checks each computer for profiles and deletes the ones matching the required deletion criteria
+$codeContainer = {
+    Param([string]$CompName)
+    
+    $age = -30 #how many days old should the profiles be for deletion? Need to use a negative number to give a date in the past.
+    #List of profiles(by localpath) to NEVER DELETE
+    $ExclusionList = @("C:\Users\Administrator","C:\Users\scriptlogger")
+    #list of profiles(by localpath) to ALWAYS DELETE
+    $InclusionList = @("C:\Users\testAccount","C:\Users\otherTestAccount")
+
+    Try {
+        #get the list of profiles on the computer. Excluding special profiles, profiles on the exclusion list, and 
+        $localProfiles = Get-CIMInstance -ClassName Win32_UserProfile -ComputerName $CompName | Where-Object { ($false -eq $_.Special) -and $ExclusionList -notcontains $_.localpath -and $_.LocalPath -notlike "*Administrator*" -and $_.LocalPath -notlike "*training*" }
+        #get the list of profiles that we are going to delete
+        $deleteProfiles = $localProfiles | Where-Object { ( ("Loaded" -ne $_.Loaded) -and ($_.LastUseTime -lt (Get-Date).AddDays($age) ) ) -or ($InclusionList -like $_.LocalPath -or $_.LocalPath -like "*.Taxlan" -or $_.LocalPath -like "*temp*" )}
+        #Delete the profiles
+        $deleteProfiles | Remove-CIMInstance
+        #List of deleted profiles to be outputted to log
+        $deletedList = $deleteProfiles | Select-Object PScomputername, @{Name="UserName"
+        Return ($deletedList) 
+    } #end try
+    Catch {Return "Error while deleting profiles on $compName" }
+} #end of $codeContainer
+
+#create the runspace pool to use a max of 50 runspaces at a time
+#Too many runspaces can affect performance of the computer
+#too few will not effectively use your resources
+#Play with the number to find what works for you
+$runspacePool = [RunspaceFactory]::CreateRunspacePool(1,50)
+$runspacePool.ApartmentState = "MTA" #Multi Threaded Apartment,
+$runspacePool.Open() #open the pool (jump in, the water feels great!)
+
+#threads will contain the output from each runspace
+$threads = @()
+
+#go through each computer on the list
+#create the runspace object for each computer
+#runs the codecontainer in each runspace
+ForEach ($computer in $computerList) {
+    Try {
+        Test-Connection -count 1 $computer -ErrorAction Stop | Out-Null
+        $runspaceObject = [PSCustomObject] @{
+            Runspace = [Powershell]::Create()
+            Invoker = $null
+        }#end of $runspaceObject = [PSCustomObject]
+        
+        $runspaceObject.Runspace.RunSpacePool = $runspacePool #Assign the already created runspace pool to the new runspace object
+        $runspaceObject.Runspace.AddScript($codeContainer) | Out-Null #send the script in the container to the object to run
+        $runspaceObject.Runspace.AddArgument($computer) | Out-Null #Send the script's arguments for the container code to the object to run
+        $runspaceObject.Invoker = $runspaceObject.Runspace.BeginInvoke() #invoke the runspace object
+
+        $threads += $runspaceObject #add the object to $threads so I can capture output
+    
+        $elapsed = $stopwatch.Elapsed
+        Write-Output "Finished running remote command for $computer. Elapsed Time: $elapsed"
+    } #End of Try
+    Catch {"Could not find $computer"}
+
+} #End of ForEach ($computer in $computerList)
+
+#check how long it took to create all the runspaces and start deleting profiles
+$elapsedCreated = $stopwatch.Elapsed
+Write-Output "Created all runspaces. Elapsed time: $elapsedCreated"
+
+#check how long it took for the profiles to deletes
+#loop every 500 milliseconds to check the runspace objects in $threads to see if they have all completed
+While ($threads.Invoker.IsCompleted -contains $false) {Start-Sleep -m 500}
+$elapsedCompleted = $stopwatch.Elapsed
+Write-Output "All runspaces completed. Elapsed time: $elapsedCompleted"
+
+#Go through all the threads, get their output, and dispose
+$threadResults = @()
+forEach ($thread in $threads) {
+    $threadResults += $thread.Runspace.EndInvoke($thread.Invoker)
+    $thread.Runspace.Dispose()
+} #End of ForEach ($thread in $threads)
+
+#Always clean up after yourself
+#Pool is closed, everyone out!
+$runspacePool.Close()
+$runspacePool.Dispose()
+
+$elapsedFinished = $stopwatch.Elapsed
+$threadResults += "Script complete. Elapsed time: $elapsedFinished"
+$todaydate = (Get-Date).toString("yyyyMMdd")
+
+#logging the results of the script
+$threadResults | Out-File -FilePath "C:\ScriptLogs\ProfileCleanup\ProfileCleanup$todaydate.txt"
