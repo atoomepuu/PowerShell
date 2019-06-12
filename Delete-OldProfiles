@@ -27,7 +27,7 @@ $codeContainer = {
         #Delete the profiles
         $deleteProfiles | Remove-CIMInstance
         #List of deleted profiles to be outputted to log
-        $deletedList = $deleteProfiles | Select-Object PScomputername, @{Name="UserName"
+        $deletedList = $deleteProfiles | Select-Object PScomputername, @{Name="UserName";Expression={$_.LocalPath.Replace('C:\Users\','')}}
         Return ($deletedList) 
     } #end try
     Catch {Return "Error while deleting profiles on $compName" }
